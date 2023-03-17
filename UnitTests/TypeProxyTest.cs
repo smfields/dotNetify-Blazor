@@ -26,6 +26,12 @@ namespace UnitTests
          [Watch]
          public string StringValue { get; set; }
       }
+      
+      public interface IStateDisposable
+      {
+         public void Dispose();
+         public Task DisposeAsync();
+      }
 
       public interface IStateWithMethods
       {
@@ -41,12 +47,39 @@ namespace UnitTests
 
          public void SubmitDynamic(dynamic arg);
       }
+      
+      public interface IStateWithAsyncMethods
+      {
+         public Task Submit();
+
+         public Task SubmitString(string arg);
+
+         public Task SubmitInt(int arg);
+
+         public Task SubmitDouble(double arg);
+
+         public Task SubmitList(List<string> arg);
+
+         public Task SubmitDynamic(dynamic arg);
+      }
+
+      [TestMethod]
+      public void TypeProxy_CanSetDefaultValues()
+      {
+         var obj = TypeProxy.Create<IState>();
+         
+         Assert.AreEqual(null, obj.StringValue);
+         Assert.AreEqual(default(int), obj.IntValue);
+         Assert.AreEqual(default(double), obj.DoubleValue);
+         Assert.AreEqual(null, obj.StringEnumerable);
+         Assert.AreEqual(null, obj.IntEnumerable);
+      }
 
       [TestMethod]
       public void TypeProxy_CanCreateObject()
       {
          var obj = TypeProxy.Create<IState>();
-
+         
          obj.StringValue = "hello";
          obj.IntValue = int.MaxValue;
          obj.DoubleValue = Math.PI;
@@ -81,10 +114,9 @@ namespace UnitTests
       public void TypeProxy_CanDeserializeObject()
       {
          string data = "{\"StringValue\":\"hello\",\"IntValue\":2147483647,\"DoubleValue\":3.141592653589793,\"StringEnumerable\":[\"Alpha\",\"Omega\"],\"IntEnumerable\":[-2147483648,2147483647]}";
-
-         Type objType = TypeProxy.CreateType<IState>();
-         IState obj = (IState) JsonConvert.DeserializeObject(data, objType);
-
+         
+         IState obj = JsonConvert.DeserializeObject<IState>(data, new ProxyConverter<IState>());
+      
          Assert.AreEqual("hello", obj.StringValue);
          Assert.AreEqual(int.MaxValue, obj.IntValue);
          Assert.AreEqual(Math.PI, obj.DoubleValue);
@@ -156,6 +188,76 @@ namespace UnitTests
          obj.SubmitDynamic(dynamicValue);
          Assert.AreEqual(nameof(IStateWithMethods.SubmitDynamic), name);
          Assert.AreEqual(dynamicValue, value);
+      }
+      
+      [TestMethod]
+      public async Task TypeProxy_CanCreateObjectAsyncMethod()
+      {
+         var obj = TypeProxy.Create<IStateWithAsyncMethods>();
+         string name = null;
+         object value = null;
+
+         var mockVMProxy = Substitute.For<IVMProxy>();
+         mockVMProxy.DispatchAsync(Arg.Any<string>(), Arg.Any<object>()).Returns(args =>
+         {
+            name = args[0].ToString();
+            value = args[1];
+            return Task.CompletedTask;
+         });
+         (obj as IVMState).VMProxy = mockVMProxy;
+
+         await obj.Submit();
+         Assert.AreEqual(nameof(IStateWithMethods.Submit), name);
+         Assert.IsNull(value);
+
+         var stringValue = "hello world";
+         await obj.SubmitString(stringValue);
+         Assert.AreEqual(nameof(IStateWithMethods.SubmitString), name);
+         Assert.AreEqual(stringValue, value);
+
+         var intValue = int.MaxValue;
+         await obj.SubmitInt(intValue);
+         Assert.AreEqual(nameof(IStateWithMethods.SubmitInt), name);
+         Assert.AreEqual(intValue, value);
+
+         var doubleValue = Math.PI;
+         await obj.SubmitDouble(doubleValue);
+         Assert.AreEqual(nameof(IStateWithMethods.SubmitDouble), name);
+         Assert.AreEqual(doubleValue, value);
+
+         var listValue = new List<string> { "Hello", "World" };
+         await obj.SubmitList(listValue);
+         Assert.AreEqual(nameof(IStateWithMethods.SubmitList), name);
+         Assert.AreEqual(listValue, value);
+
+         var dynamicValue = new { FirstName = "Hello", LastName = "World" };
+         await obj.SubmitDynamic(dynamicValue);
+         Assert.AreEqual(nameof(IStateWithMethods.SubmitDynamic), name);
+         Assert.AreEqual(dynamicValue, value);
+      }
+      
+      [TestMethod]
+      public void TypeProxy_CanCreateObjectDisposable()
+      {
+         var obj = TypeProxy.Create<IStateDisposable>();
+         var mockVMProxy = Substitute.For<IVMProxy>();
+         (obj as IVMState).VMProxy = mockVMProxy;
+         
+         obj.Dispose();
+
+         mockVMProxy.Received().DisposeAsync();
+      }
+      
+      [TestMethod]
+      public async Task TypeProxy_CanCreateObjectAsyncDisposable()
+      {
+         var obj = TypeProxy.Create<IStateDisposable>();
+         var mockVMProxy = Substitute.For<IVMProxy>();
+         (obj as IVMState).VMProxy = mockVMProxy;
+         
+         await obj.DisposeAsync();
+
+         mockVMProxy.Received().DisposeAsync();
       }
    }
 }

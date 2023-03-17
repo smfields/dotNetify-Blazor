@@ -86,7 +86,7 @@ namespace DotNetify.Blazor
       public static T As<T>(this object arg)
       {
          if (typeof(T).IsInterface)
-            return arg.As(s => (T) JsonConvert.DeserializeObject(s, TypeProxy.CreateType<T>()));
+            return arg.As(s => JsonConvert.DeserializeObject<T>(s, new ProxyConverter<T>()));
 
          return arg.As(s => JsonConvert.DeserializeObject<T>(s));
       }

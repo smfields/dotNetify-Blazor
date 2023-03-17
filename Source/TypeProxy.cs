@@ -18,9 +18,11 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
-using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
+using Castle.DynamicProxy;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Converters;
 
 [assembly: InternalsVisibleTo("DotNetify.Blazor.UnitTests")]
 
@@ -33,240 +35,170 @@ namespace DotNetify.Blazor
       }
    }
 
-   public abstract class BaseObject<TInterface> : IVMState
+   public abstract class BaseObject : IVMState
+   {
+      [JsonIgnore]
+      public IVMProxy VMProxy { get; set; }
+   }
+
+   internal class ProxyConverter<T> : CustomCreationConverter<T>
+   {
+      public override T Create(Type objectType)
+      {
+         return TypeProxy.Create<T>();
+      }
+   }
+
+   internal class ProxyInterceptor<T> : IInterceptor
    {
       private readonly Dictionary<string, object> _propValues = new Dictionary<string, object>();
-
+      private readonly PropertyInfo[] _interfaceProperties = typeof(T).GetProperties();
+      
       private enum ReservedMethod
       {
          Dispatch,
-         Dispose
+         Dispose,
+         DispatchAsync,
+         DisposeAsync
       }
 
-      [JsonIgnore]
-      public IVMProxy VMProxy { get; set; }
-
-      public T Get<T>(string propName)
+      public void Intercept(IInvocation invocation)
       {
-         if (!_propValues.ContainsKey(propName))
-            _propValues[propName] = default(T);
-
-         return (T) _propValues[propName];
-      }
-
-      public void Set<T>(string propName, T value) => _propValues[propName] = value;
-
-      public void SetWithWatch<T>(string propName, T value)
-      {
-         _propValues[propName] = value;
-         VMProxy?.DispatchAsync(propName, value);
-      }
-
-      public void DispatchMethod(string methodName, List<object> args)
-      {
-         var value = args?.FirstOrDefault();
-
-         if (methodName == nameof(ReservedMethod.Dispose))
-            VMProxy?.DisposeAsync();
-         else if (methodName == nameof(ReservedMethod.Dispatch))
+         if (IsProperty(invocation))
          {
-            if (value is Dictionary<string, object>)
-               VMProxy?.DispatchAsync(value as Dictionary<string, object>);
-            else
-               throw new TypeProxyException("'Dispatch' is a reserved method that requires a single argument of type Dictionary<string, object>.");
+            HandleProperty(invocation);
          }
          else
-            VMProxy?.DispatchAsync(methodName, value);
+         {
+            HandleMethod(invocation);
+         }
+      }
+      
+      private bool IsProperty(IInvocation invocation)
+      {
+         var method = invocation.Method;
+         return _interfaceProperties.Any(prop => prop.GetAccessors().Contains(method));
+      }
+      
+      private bool IsAsyncMethod(IInvocation invocation)
+      {
+         var method = invocation.Method;
+         var returnType = method.ReturnType;
+         return typeof(Task).IsAssignableFrom(returnType);
+      }
+      
+      private void HandleProperty(IInvocation invocation)
+      {
+         var method = invocation.Method;
+         var property = _interfaceProperties.First(prop => prop.GetAccessors().Contains(method));
+        
+         if (invocation.Method == property.SetMethod)
+         {
+            HandleSetProperty(invocation, property);
+         }
+         else
+         {
+            HandleGetProperty(invocation, property);
+         }
+      }
+
+      private void HandleSetProperty(IInvocation invocation, PropertyInfo property)
+      {
+         var value = invocation.Arguments.First();
+         _propValues[property.Name] = value;
+
+         var hasWatchAttribute = property.GetCustomAttribute<WatchAttribute>() != null;
+         if (hasWatchAttribute)
+         {
+            var vmProxy = GetVMProxy(invocation);
+            vmProxy.DispatchAsync(property.Name, value);
+         }
+      }
+
+      private void HandleGetProperty(IInvocation invocation, PropertyInfo property)
+      {
+         if (!_propValues.ContainsKey(property.Name))
+         {
+            invocation.ReturnValue = GetDefaultPropertyValue(property);
+         }
+         else
+         {
+            invocation.ReturnValue = _propValues[property.Name];
+         }
+      }
+
+      private void HandleMethod(IInvocation invocation)
+      {
+         var vmProxy = GetVMProxy(invocation);
+         var methodName = invocation.Method.Name;
+         Task returnTask;
+         
+         if (methodName == nameof(ReservedMethod.Dispose) || methodName == nameof(ReservedMethod.DisposeAsync))
+         {
+            returnTask = vmProxy.DisposeAsync();
+         }
+         else if (methodName == nameof(ReservedMethod.Dispatch) || methodName == nameof(ReservedMethod.DispatchAsync))
+         {
+            var value = invocation.Arguments.FirstOrDefault();
+            if (value is Dictionary<string, object> properties)
+            {
+               returnTask = vmProxy.DispatchAsync(properties);
+            }
+            else
+            {
+               throw new TypeProxyException("'Dispatch' is a reserved method that requires a single argument of type Dictionary<string, object>.");
+            }
+         }
+         else
+         {
+            var value = invocation.Arguments.FirstOrDefault();
+            returnTask = vmProxy.DispatchAsync(methodName, value);
+         }
+
+         if (IsAsyncMethod(invocation))
+         {
+            invocation.ReturnValue = returnTask;
+         }
+      }
+
+      private IVMProxy GetVMProxy(IInvocation invocation)
+      {
+         var vmProxy = ((BaseObject)invocation.Proxy).VMProxy;
+
+         if (vmProxy == null)
+         {
+            throw new TypeProxyException("VMProxy has not been provided");
+         }
+
+         return vmProxy;
+      }
+      
+      private object GetDefaultPropertyValue(PropertyInfo propertyInfo)
+      {
+         return GetType()
+                .GetMethod(nameof(GetDefaultGeneric), BindingFlags.Instance | BindingFlags.NonPublic)!
+                .MakeGenericMethod(propertyInfo.PropertyType)
+                .Invoke(this, null);
+      }
+
+      private TValue GetDefaultGeneric<TValue>()
+      {
+         return default;
       }
    }
 
-   /// <summary>
-   /// Creates proxies for types, but limited to public properties.
-   /// </summary>
    public static class TypeProxy
    {
-      private static ModuleBuilder _builder;
-      private static readonly Dictionary<string, Type> _createdTypes = new Dictionary<string, Type>();
-      private static readonly object _sync = new object();
-
-      internal static Type CreateType<T>()
+      private static readonly ProxyGenerator Generator = new ProxyGenerator();
+      
+      public static T Create<T>()
       {
-         if (!typeof(T).IsInterface)
-            throw new TypeProxyException("TypeProxy is only for interface.");
-
-         lock (_sync)
+         var proxy = Generator.CreateInterfaceProxyWithoutTarget(typeof(T), new ProxyGenerationOptions()
          {
-            Type ifaceType = typeof(T);
-            Type baseType = typeof(BaseObject<>).MakeGenericType(ifaceType);
-            string typeName = ToObjectTypeName(ifaceType);
-
-            Type objectType = _createdTypes.ContainsKey(typeName) ? _createdTypes[typeName] : null;
-            if (objectType == null)
-            {
-               ModuleBuilder builder = GetModuleBuilder();
-
-               var typeBuilder = builder.DefineType(typeName, TypeAttributes.Public | TypeAttributes.Class, baseType);
-               typeBuilder.AddInterfaceImplementation(ifaceType);
-               typeBuilder.DefineDefaultConstructor(MethodAttributes.Public);
-
-               var typesToBuild = new List<Type>();
-               var typesToCheck = new Stack<Type>();
-               typesToCheck.Push(ifaceType);
-               while (typesToCheck.Count > 0)
-               {
-                  Type typeToCheck = typesToCheck.Pop();
-                  typeToCheck.GetInterfaces().ToList().ForEach(type => typesToCheck.Push(type));
-                  typesToBuild.Add(typeToCheck);
-               }
-
-               typesToBuild.ForEach(type =>
-               {
-                  typeBuilder.BuildProperties(type, baseType);
-                  typeBuilder.BuildMethods(type, baseType);
-               });
-
-               objectType = typeBuilder.CreateTypeInfo();
-               _createdTypes[typeName] = objectType;
-            }
-
-            return objectType;
-         }
+            BaseTypeForInterfaceProxy = typeof(BaseObject)
+         }, new ProxyInterceptor<T>());
+         return (T) proxy;
       }
-
-      /// <summary>
-      /// Creates a concrete class instance of an interface to communicate with the server-side view model.
-      /// </summary>
-      public static T Create<T>() where T : class
-      {
-         return (T) Activator.CreateInstance(CreateType<T>());
-      }
-
-      private static ModuleBuilder GetModuleBuilder()
-      {
-         if (_builder != null)
-            return _builder;
-
-         var assembly = AssemblyBuilder.DefineDynamicAssembly(new AssemblyName("DotNetifyBlazorDynamicAssembly"), AssemblyBuilderAccess.Run);
-         _builder = assembly.DefineDynamicModule("DotNetifyBlazorDynamicModule");
-         return _builder;
-      }
-
-      private static void BuildProperties(this TypeBuilder typeBuilder, Type ifaceType, Type baseType)
-      {
-         foreach (PropertyInfo prop in ifaceType.GetProperties(BindingFlags.Instance | BindingFlags.Public))
-         {
-            var propBuilder = typeBuilder.DefineProperty(prop.Name, PropertyAttributes.HasDefault, prop.PropertyType, null);
-
-            if (prop.CanRead)
-            {
-               var getMethod = prop.GetGetMethod();
-               var methodParams = getMethod.GetParameters();
-               bool isIndexer = methodParams.Length > 0;
-               var paramTypes = isIndexer ? methodParams.Select(x => x.ParameterType) : Type.EmptyTypes;
-
-               var methodBuilder = typeBuilder.DefineMethod(getMethod.Name, MethodAttributes.Public | MethodAttributes.Virtual, prop.PropertyType, paramTypes.ToArray());
-               ILGenerator il = methodBuilder.GetILGenerator();
-               il.Emit(OpCodes.Ldarg_0);
-               if (!isIndexer)
-               {
-                  il.Emit(OpCodes.Ldstr, prop.Name);
-                  il.Emit(OpCodes.Call, baseType.GetMethod("Get").MakeGenericMethod(prop.PropertyType));
-               }
-               il.Emit(OpCodes.Ret);
-
-               propBuilder.SetGetMethod(methodBuilder);
-            }
-
-            if (prop.CanWrite)
-            {
-               var setMethod = prop.GetSetMethod();
-
-               var baseTypeSetMethodName = prop.GetCustomAttribute<WatchAttribute>() != null ? "SetWithWatch" : "Set";
-
-               var baseStubMethod = baseType.GetMethod(baseTypeSetMethodName).MakeGenericMethod(setMethod.GetParameters().First().ParameterType);
-               var paramTypes = setMethod.GetParameters().Select(paramInfo => paramInfo.ParameterType).ToArray();
-               var methodBuilder = typeBuilder.DefineMethod(setMethod.Name, MethodAttributes.Public | MethodAttributes.Virtual, typeof(void), paramTypes);
-               ILGenerator il = methodBuilder.GetILGenerator();
-               il.Emit(OpCodes.Ldarg_0);
-               il.Emit(OpCodes.Ldstr, prop.Name);
-               il.Emit(OpCodes.Ldarg_1);
-               il.Emit(OpCodes.Call, baseStubMethod);
-               il.Emit(OpCodes.Ret);
-
-               propBuilder.SetSetMethod(methodBuilder);
-            }
-         }
-      }
-
-      private static void BuildMethods(this TypeBuilder typeBuilder, Type ifaceType, Type baseType)
-      {
-         foreach (MethodInfo method in ifaceType.GetMethods(BindingFlags.Instance | BindingFlags.Public).Where(method => !method.IsSpecialName))
-         {
-            if (method.ReturnType != typeof(void))
-               throw new TypeProxyException($"Could not create proxy for '{ifaceType.Name}' because method '{method.Name}' is not a void method.");
-
-            var baseMethod = baseType.GetMethod("DispatchMethod");
-            var paramTypes = method.GetParameters().Select(paramInfo => paramInfo.ParameterType).ToArray();
-            var methodBuilder = typeBuilder.DefineMethod(method.Name, MethodAttributes.Public | MethodAttributes.Virtual, method.ReturnType, paramTypes);
-
-            var genericArgumentArray = method.GetGenericArguments();
-            if (genericArgumentArray.Any())
-               methodBuilder.DefineGenericParameters(genericArgumentArray.Select(arg => arg.Name).ToArray());
-
-            ILGenerator il = methodBuilder.GetILGenerator();
-
-            il.BuildArgumentList(method.GetParameters());
-            il.Emit(OpCodes.Ldarg_0);
-            il.Emit(OpCodes.Ldstr, method.Name);
-            il.Emit(OpCodes.Ldloc_0);
-
-            il.Emit(OpCodes.Call, baseMethod);
-            il.Emit(OpCodes.Ret);
-         }
-      }
-
-      private static void BuildArgumentList(this ILGenerator il, ParameterInfo[] methodParams)
-      {
-         var addListMethod = typeof(List<object>).GetMethod("Add", new Type[] { typeof(object) });
-         var byRefValueTypes = new Dictionary<Type, Action<Type>>
-            {
-                {typeof(bool),      t => il.Emit(OpCodes.Ldind_U1) },
-                {typeof(short),     t => il.Emit(OpCodes.Ldind_I2) },
-                {typeof(int),       t => il.Emit(OpCodes.Ldind_I4) },
-                {typeof(float),     t => il.Emit(OpCodes.Ldind_R4) },
-                {typeof(double),    t => il.Emit(OpCodes.Ldind_R8) },
-                {typeof(decimal),   t => il.Emit(OpCodes.Ldobj, t) }
-            };
-
-         il.DeclareLocal(typeof(List<object>), true);
-         il.Emit(OpCodes.Newobj, typeof(List<object>).GetConstructor(Type.EmptyTypes));
-         il.Emit(OpCodes.Stloc_0);
-
-         for (int i = 0; i < methodParams.Length; i++)
-         {
-            var methodParam = methodParams[i];
-
-            il.Emit(OpCodes.Ldloc_0);
-            il.Emit(OpCodes.Ldarg, i + 1);
-
-            if (methodParam.ParameterType.IsByRef || methodParam.IsOut)
-            {
-               var type = methodParam.ParameterType.GetElementType();
-               if (byRefValueTypes.ContainsKey(type))
-               {
-                  byRefValueTypes[type](type);
-                  il.Emit(OpCodes.Box, type);
-               }
-               else
-                  il.Emit(OpCodes.Ldind_Ref);
-            }
-            else if (methodParam.ParameterType.IsValueType || methodParam.ParameterType.IsGenericParameter)
-               il.Emit(OpCodes.Box, methodParams[i].ParameterType);
-
-            il.EmitCall(OpCodes.Callvirt, addListMethod, null);
-         }
-      }
-
-      private static string ToObjectTypeName(Type type) => $"Impl__{type.FullName}";
    }
+   
 }
