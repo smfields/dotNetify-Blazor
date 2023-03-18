@@ -257,7 +257,7 @@ namespace UnitTests
          
          await obj.DisposeAsync();
 
-         mockVMProxy.Received().DisposeAsync();
+         await mockVMProxy.Received().DisposeAsync();
       }
    }
 }
