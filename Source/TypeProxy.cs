@@ -19,10 +19,12 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using System.Threading.Tasks;
 using Castle.DynamicProxy;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Converters;
+
 
 [assembly: InternalsVisibleTo("DotNetify.Blazor.UnitTests")]
 
@@ -41,18 +43,25 @@ namespace DotNetify.Blazor
       public IVMProxy VMProxy { get; set; }
    }
 
-   internal class ProxyConverter<T> : CustomCreationConverter<T>
+   internal class ProxyTypeInfoResolver : DefaultJsonTypeInfoResolver
    {
-      public override T Create(Type objectType)
+      public override JsonTypeInfo GetTypeInfo(Type type, JsonSerializerOptions options)
       {
-         return TypeProxy.Create<T>();
+         JsonTypeInfo typeInfo = base.GetTypeInfo(type, options);
+
+         if (typeInfo.Kind == JsonTypeInfoKind.Object && typeInfo.Type.IsInterface)
+         {
+            typeInfo.CreateObject = () => TypeProxy.Create(type);
+         }
+
+         return typeInfo;
       }
    }
 
-   internal class ProxyInterceptor<T> : IInterceptor
+   internal class ProxyInterceptor : IInterceptor
    {
       private readonly Dictionary<string, object> _propValues = new Dictionary<string, object>();
-      private readonly PropertyInfo[] _interfaceProperties = typeof(T).GetProperties();
+      private readonly PropertyInfo[] _interfaceProperties;
       
       private enum ReservedMethod
       {
@@ -60,6 +69,11 @@ namespace DotNetify.Blazor
          Dispose,
          DispatchAsync,
          DisposeAsync
+      }
+
+      public ProxyInterceptor(Type interfaceType)
+      {
+         _interfaceProperties = interfaceType.GetProperties();
       }
 
       public void Intercept(IInvocation invocation)
@@ -193,11 +207,26 @@ namespace DotNetify.Blazor
       
       public static T Create<T>()
       {
-         var proxy = Generator.CreateInterfaceProxyWithoutTarget(typeof(T), new ProxyGenerationOptions()
+         return (T)Create(typeof(T));
+      }
+      
+      public static object Create(Type type)
+      {
+         var proxy = Generator.CreateInterfaceProxyWithoutTarget(type, new ProxyGenerationOptions()
          {
             BaseTypeForInterfaceProxy = typeof(BaseObject)
-         }, new ProxyInterceptor<T>());
-         return (T) proxy;
+         }, new ProxyInterceptor(type));
+         return proxy;
+      }
+
+      public static T Deserialize<T>(string data)
+      {
+         var jsonSettings = new JsonSerializerOptions()
+         {
+            TypeInfoResolver = new ProxyTypeInfoResolver()
+         };
+         
+         return JsonSerializer.Deserialize<T>(data, jsonSettings);
       }
    }
    

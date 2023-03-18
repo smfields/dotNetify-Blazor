@@ -16,9 +16,9 @@ limitations under the License.
 
 using Microsoft.AspNetCore.Components;
 using Microsoft.JSInterop;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Serialization;
 using System;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 
 namespace DotNetify.Blazor
@@ -30,22 +30,15 @@ namespace DotNetify.Blazor
    {
       private readonly IJSRuntime _jsRuntime;
 
-      internal static readonly JsonSerializerSettings _serializerSettings = new JsonSerializerSettings
+      internal static readonly JsonSerializerOptions _serializerSettings = new JsonSerializerOptions()
       {
-         ReferenceLoopHandling = ReferenceLoopHandling.Ignore
+         ReferenceHandler = ReferenceHandler.IgnoreCycles
       };
-
-      internal static readonly JsonSerializerSettings _serializerCamelCaseSettings = new JsonSerializerSettings
+      
+      internal static readonly JsonSerializerOptions _serializerCamelCaseSettings = new JsonSerializerOptions()
       {
-         ReferenceLoopHandling = ReferenceLoopHandling.Ignore,
-         ContractResolver = new CamelCasePropertyNamesContractResolver()
-         {
-            NamingStrategy = new CamelCaseNamingStrategy()
-            {
-               ProcessDictionaryKeys = false,
-               OverrideSpecifiedNames = true
-            }
-         }
+         ReferenceHandler = ReferenceHandler.IgnoreCycles,
+         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
       };
 
       public JSInterop(IJSRuntime jsRuntime)
@@ -86,9 +79,11 @@ namespace DotNetify.Blazor
       public static T As<T>(this object arg)
       {
          if (typeof(T).IsInterface)
-            return arg.As(s => JsonConvert.DeserializeObject<T>(s, new ProxyConverter<T>()));
+         {
+            return arg.As(s => TypeProxy.Deserialize<T>(s));
+         }
 
-         return arg.As(s => JsonConvert.DeserializeObject<T>(s));
+         return arg.As(s => JsonSerializer.Deserialize<T>(s));
       }
 
       public static T As<T>(this object arg, Func<string, T> deserialize)
@@ -102,7 +97,7 @@ namespace DotNetify.Blazor
          }
          catch (Exception ex)
          {
-            throw new JsonSerializationException($"Cannot deserialize {arg} to {typeof(T)}", ex);
+            throw new JsonException($"Cannot deserialize {arg} to {typeof(T)}", ex);
          }
       }
 
@@ -111,7 +106,7 @@ namespace DotNetify.Blazor
          if (typeof(T) == typeof(string))
             return arg.ToString();
 
-         return JsonConvert.SerializeObject(arg, camelCase ? JSInterop._serializerCamelCaseSettings : JSInterop._serializerSettings);
+         return JsonSerializer.Serialize(arg, camelCase ? JSInterop._serializerCamelCaseSettings : JSInterop._serializerSettings);
       }
    }
 }

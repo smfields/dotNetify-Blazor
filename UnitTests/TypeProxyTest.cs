@@ -1,10 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.Json;
 using System.Threading.Tasks;
 using DotNetify.Blazor;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
-using Newtonsoft.Json;
 using NSubstitute;
 
 namespace UnitTests
@@ -106,7 +106,7 @@ namespace UnitTests
          obj.StringEnumerable = new List<string> { "Alpha", "Omega" };
          obj.IntEnumerable = new int[] { int.MinValue, int.MaxValue };
 
-         string serialized = JsonConvert.SerializeObject((IState) obj);
+         string serialized = JsonSerializer.Serialize(obj);
          Assert.AreEqual("{\"StringValue\":\"hello\",\"IntValue\":2147483647,\"DoubleValue\":3.141592653589793,\"StringEnumerable\":[\"Alpha\",\"Omega\"],\"IntEnumerable\":[-2147483648,2147483647]}", serialized);
       }
 
@@ -114,8 +114,8 @@ namespace UnitTests
       public void TypeProxy_CanDeserializeObject()
       {
          string data = "{\"StringValue\":\"hello\",\"IntValue\":2147483647,\"DoubleValue\":3.141592653589793,\"StringEnumerable\":[\"Alpha\",\"Omega\"],\"IntEnumerable\":[-2147483648,2147483647]}";
-         
-         IState obj = JsonConvert.DeserializeObject<IState>(data, new ProxyConverter<IState>());
+
+         IState obj = TypeProxy.Deserialize<IState>(data);
       
          Assert.AreEqual("hello", obj.StringValue);
          Assert.AreEqual(int.MaxValue, obj.IntValue);
